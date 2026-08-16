@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState, type ReactElement } from 'react';
+import { useMemo, useState, useRef, useCallback, type ReactElement, type KeyboardEvent } from 'react';
 import { Flame } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { scaleBand } from 'd3-scale';
@@ -119,14 +119,19 @@ export default function GasHeatmap({
   metrics = GAS_METRICS,
 }: GasHeatmapProps = {}): ReactElement {
   const { t } = useTranslation();
-  // Local state holds the dataset so it can later be updated from live data.
   const [usages] = useState<FunctionGasUsage[]>(data);
   const [focused, setFocused] = useState<HeatmapCell | null>(null);
+  const [focusedPos, setFocusedPos] = useState<{ row: number; col: number } | null>(null);
+
+  const cellRefs = useRef<(SVGRectElement | null)[][]>([]);
 
   const grid = useMemo(() => buildHeatmap(usages, metrics), [usages, metrics]);
   const hotspots = useMemo(() => findHotspots(usages, metrics), [usages, metrics]);
 
   const functionNames = usages.map((usage) => usage.functionName);
+  const rowCount = functionNames.length;
+  const colCount = metrics.length;
+
   const width = MARGIN.left + metrics.length * CELL_WIDTH + MARGIN.right;
   const height = MARGIN.top + functionNames.length * CELL_HEIGHT + MARGIN.bottom;
 
@@ -138,6 +143,71 @@ export default function GasHeatmap({
     .domain(functionNames)
     .range([MARGIN.top, height - MARGIN.bottom])
     .padding(0.12);
+
+  // Keep refs array sized correctly
+  if (cellRefs.current.length !== rowCount) {
+    cellRefs.current = Array.from({ length: rowCount }, () => Array(colCount).fill(null));
+  }
+
+  const focusCell = useCallback(
+    (row: number, col: number) => {
+      if (row < 0 || row >= rowCount || col < 0 || col >= colCount) return;
+
+      const cell = grid[row][col];
+      setFocused(cell);
+      setFocusedPos({ row, col });
+
+      // Move actual DOM focus
+      const el = cellRefs.current[row]?.[col];
+      el?.focus();
+    },
+    [grid, rowCount, colCount]
+  );
+
+  const handleKeyDown = useCallback(
+    (e: KeyboardEvent, row: number, col: number) => {
+      let nextRow = row;
+      let nextCol = col;
+
+      switch (e.key) {
+        case 'ArrowRight':
+          e.preventDefault();
+          nextCol = Math.min(col + 1, colCount - 1);
+          break;
+        case 'ArrowLeft':
+          e.preventDefault();
+          nextCol = Math.max(col - 1, 0);
+          break;
+        case 'ArrowDown':
+          e.preventDefault();
+          nextRow = Math.min(row + 1, rowCount - 1);
+          break;
+        case 'ArrowUp':
+          e.preventDefault();
+          nextRow = Math.max(row - 1, 0);
+          break;
+        case 'Home':
+          e.preventDefault();
+          nextCol = 0;
+          break;
+        case 'End':
+          e.preventDefault();
+          nextCol = colCount - 1;
+          break;
+        case 'Enter':
+        case ' ':
+          e.preventDefault();
+          // Already focused — just ensure the live region is updated
+          focusCell(row, col);
+          return;
+        default:
+          return;
+      }
+
+      focusCell(nextRow, nextCol);
+    },
+    [colCount, rowCount, focusCell]
+  );
 
   if (usages.length === 0) {
     return (
@@ -173,25 +243,35 @@ export default function GasHeatmap({
           <span>{t('gasHeatmap.legendLow')}</span>
           <span
             className="h-2.5 w-24 rounded-full"
-            style={{ background: `linear-gradient(to right, ${interpolateYlOrRd(0.05)}, ${interpolateYlOrRd(0.5)}, ${interpolateYlOrRd(1)})` }}
+            style={{
+              background: `linear-gradient(to right, ${interpolateYlOrRd(0.05)}, ${interpolateYlOrRd(0.5)}, ${interpolateYlOrRd(1)})`,
+            }}
             aria-hidden="true"
           />
           <span>{t('gasHeatmap.legendHigh')}</span>
         </div>
       </div>
 
+      {/* Keyboard instructions (visually subtle, available to screen readers) */}
+      <p className="sr-only">
+        Use arrow keys to navigate between cells. Press Enter or Space to select a cell.
+      </p>
+
       <div className="overflow-x-auto">
         <svg
-          role="img"
+          role="grid"
           aria-label={t('gasHeatmap.ariaLabel')}
+          aria-rowcount={rowCount}
+          aria-colcount={colCount}
           viewBox={`0 0 ${width} ${height}`}
           className="w-full"
           style={{ minWidth: width }}
         >
           {/* Metric column headers */}
-          {metrics.map((metric) => (
+          {metrics.map((metric, colIndex) => (
             <text
               key={`col-${metric}`}
+              role="columnheader"
               x={(xScale(metric) ?? 0) + xScale.bandwidth() / 2}
               y={MARGIN.top - 12}
               textAnchor="middle"
@@ -216,19 +296,31 @@ export default function GasHeatmap({
           ))}
 
           {/* Cells */}
-          {grid.map((row) =>
-            row.map((cell) => {
+          {grid.map((row, rowIndex) =>
+            row.map((cell, colIndex) => {
               const x = xScale(cell.metric) ?? 0;
               const y = yScale(cell.functionName) ?? 0;
               const fill = interpolateYlOrRd(0.05 + cell.intensity * 0.95);
-              const titleText = `${cell.functionName} · ${t(METRIC_LABEL_KEYS[cell.metric])}: ${formatGas(cell.value)}`;
+              const isFocused =
+                focusedPos?.row === rowIndex && focusedPos?.col === colIndex;
+
+              const accessibleName = `${cell.functionName}, ${t(
+                METRIC_LABEL_KEYS[cell.metric]
+              )}: \( {formatGas(cell.value)} \){cell.isHotspot ? ', hotspot' : ''}`;
+
               return (
-                <g
-                  key={`${cell.functionName}-${cell.metric}`}
-                  onMouseEnter={() => setFocused(cell)}
-                  onMouseLeave={() => setFocused(null)}
-                >
+                <g key={`\( {cell.functionName}- \){cell.metric}`}>
                   <rect
+                    ref={(el) => {
+                      if (!cellRefs.current[rowIndex]) {
+                        cellRefs.current[rowIndex] = [];
+                      }
+                      cellRefs.current[rowIndex][colIndex] = el;
+                    }}
+                    role="gridcell"
+                    tabIndex={isFocused || (rowIndex === 0 && colIndex === 0 && !focusedPos) ? 0 : -1}
+                    aria-label={accessibleName}
+                    aria-selected={isFocused}
                     data-testid="gas-cell"
                     data-hotspot={cell.isHotspot}
                     data-function={cell.functionName}
@@ -239,11 +331,31 @@ export default function GasHeatmap({
                     height={yScale.bandwidth()}
                     rx={6}
                     fill={fill}
-                    stroke={cell.isHotspot ? '#7c2d12' : 'transparent'}
-                    strokeWidth={cell.isHotspot ? 2 : 0}
-                  >
-                    <title>{titleText}</title>
-                  </rect>
+                    stroke={
+                      isFocused
+                        ? '#4f46e5' // indigo focus ring
+                        : cell.isHotspot
+                        ? '#7c2d12'
+                        : 'transparent'
+                    }
+                    strokeWidth={isFocused ? 3 : cell.isHotspot ? 2 : 0}
+                    className="outline-none cursor-pointer focus:outline-none"
+                    onMouseEnter={() => {
+                      setFocused(cell);
+                      setFocusedPos({ row: rowIndex, col: colIndex });
+                    }}
+                    onMouseLeave={() => {
+                      // Keep focus if keyboard is active
+                      if (!isFocused) {
+                        setFocused(null);
+                      }
+                    }}
+                    onFocus={() => {
+                      setFocused(cell);
+                      setFocusedPos({ row: rowIndex, col: colIndex });
+                    }}
+                    onKeyDown={(e) => handleKeyDown(e, rowIndex, colIndex)}
+                  />
                   <text
                     x={x + xScale.bandwidth() / 2}
                     y={y + yScale.bandwidth() / 2}
@@ -251,6 +363,7 @@ export default function GasHeatmap({
                     dominantBaseline="middle"
                     className="text-xs font-medium pointer-events-none"
                     fill={cell.intensity > 0.55 ? '#ffffff' : '#1e293b'}
+                    aria-hidden="true"
                   >
                     {formatGas(cell.value)}
                   </text>
@@ -261,11 +374,14 @@ export default function GasHeatmap({
         </svg>
       </div>
 
-      {focused && (
-        <p className="mt-3 text-xs text-slate-600 dark:text-slate-300" aria-live="polite">
-          {focused.functionName} · {t(METRIC_LABEL_KEYS[focused.metric])}: {formatGas(focused.value)}
-        </p>
-      )}
+      {/* Live region for screen readers + visual feedback */}
+      <p className="mt-3 text-xs text-slate-600 dark:text-slate-300" aria-live="polite" aria-atomic="true">
+        {focused
+          ? `${focused.functionName} · ${t(METRIC_LABEL_KEYS[focused.metric])}: \( {formatGas(focused.value)} \){
+              focused.isHotspot ? ' (hotspot)' : ''
+            }`
+          : '\u00A0'}
+      </p>
 
       {/* Hotspots summary */}
       <div className="mt-5 border-t border-slate-200 dark:border-slate-700 pt-4">
@@ -290,4 +406,4 @@ export default function GasHeatmap({
       </div>
     </section>
   );
-}
+            }
